@@ -1,0 +1,263 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	uuid "github.com/satori/go.uuid"
+)
+
+type Bucket struct {
+	AccessKey string
+	SecretKey string
+	URL       string
+	Client    *http.Client
+}
+
+func NewBucket(ep string, accessKey string, secretKey string, bucketName string) *Bucket {
+	return &Bucket{
+		AccessKey: accessKey,
+		SecretKey: secretKey,
+		URL:       ep + "/" + bucketName,
+		Client:    &http.Client{},
+	}
+}
+
+type DirectoryEntry struct {
+	Name         string
+	ModifiedTime time.Time
+	CreatedTime  time.Time
+	Size         int64
+	Key          string
+	IsDir        bool
+}
+
+type Directory struct {
+	Entries map[string]DirectoryEntry
+}
+
+func splitPath(path string) (folder string, filename string, err error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		err = errors.New("Path is empty")
+		return
+	}
+	if !strings.HasPrefix(path, "/") {
+		err = errors.New("Path must start with /")
+		return
+	}
+	if path == "/" {
+		folder = "/root"
+		return
+	}
+
+	if strings.HasSuffix(path, "/") {
+		err = errors.New("Path must not have a trailing /")
+		return
+	}
+	parts := strings.Split(path, "/")
+	if len(parts) == 2 {
+		folder = "/root"
+		filename = parts[1]
+		return
+	}
+	folder = "/" + strings.Join(parts[1:len(parts)-1], "/")
+	filename = parts[len(parts)-1]
+	return
+}
+
+func (b *Bucket) ReadDir(path string) (dir *Directory, err error) {
+	req, err := http.NewRequest("GET", b.URL+path, nil)
+	if err != nil {
+		return
+	}
+	resp, err := b.run(req, 0)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		err = errors.New(string(body))
+		return
+	}
+	dir = &Directory{}
+	if err = json.Unmarshal(body, dir); err != nil {
+		return
+	}
+	return
+}
+
+func (b *Bucket) Mkdir(path string) (err error) {
+	dir := &Directory{
+		Created:  time.Now(),
+		Modified: time.Now(),
+		Files:    make(map[string]File),
+	}
+	body, err := json.Marshal(dir)
+	if err != nil {
+		return
+	}
+	req, err := http.NewRequest("PUT", b.URL+path, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	resp, err := b.run(req, int64(len(body)))
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	return
+}
+
+func (b *Bucket) run(req *http.Request, size int64) (resp *http.Response, err error) {
+	req.Header.Set("Date", time.Now().UTC().Format(http.TimeFormat))
+	req.ContentLength = size
+	b.sign(req)
+	resp, err = b.Client.Do(req)
+	return
+}
+
+func (b *Bucket) UpdateDir(path string, dir *Directory) (err error) {
+	body, err := json.Marshal(dir)
+	if err != nil {
+		return
+	}
+	req, err := http.NewRequest("PUT", b.URL+path, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	resp, err := b.run(req, int64(len(body)))
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	return
+}
+
+type S3Error struct {
+	StatusCode int
+	Code       string
+	Message    string
+	Key        string
+	BucketName string
+	Resource   string
+	RequestId  string
+	HostId     string
+}
+
+func (b *Bucket) delKey(key string) (statusCode int) {
+	req, err := http.NewRequest("DELETE", b.URL+"/"+key, nil)
+	if err != nil {
+		log.Println(err)
+		return http.StatusInternalServerError
+	}
+	resp, err := b.run(req, 0)
+	if err != nil {
+		log.Println(err)
+		return http.StatusInternalServerError
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			log.Println(err)
+			return http.StatusInternalServerError
+		}
+		log.Println(string(body))
+	}
+	return resp.StatusCode
+}
+
+func (b *Bucket) SaveFile(path string, content io.ReadCloser, size int64) (statusCode int) {
+	dir, err := b.ReadDir("/root")
+	if err != nil {
+		log.Println(err)
+		return http.StatusInternalServerError
+	}
+	file, exists := dir.Files[path]
+	if exists {
+		statusCode = b.delKey(file.Key)
+		if statusCode != http.StatusNoContent {
+			return
+		}
+	}
+
+	key := uuid.NewV4().String()
+	f := File{
+		Name:     path,
+		Size:     size,
+		Modified: time.Now(),
+		Created:  time.Now(),
+		Key:      key,
+	}
+	dir.Files[f.Name] = f
+	if err = b.UpdateDir("/root", dir); err != nil {
+		log.Println(err)
+		return http.StatusInternalServerError
+	}
+
+	req, err := http.NewRequest("PUT", b.URL+"/"+key, content)
+	if err != nil {
+		log.Println(err)
+		return http.StatusInternalServerError
+	}
+	resp, err := b.run(req, size)
+	if err != nil {
+		log.Println(err)
+		return http.StatusInternalServerError
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			log.Println(err)
+			return http.StatusInternalServerError
+		}
+		log.Println(string(body))
+	}
+	return resp.StatusCode
+}
+
+var debug bool
+
+func main() {
+	debug = false
+	b := NewBucket("http://192.168.1.162:9000", "LKKB31TCA0VVORCCZI6Y",
+		"5PJ7uKvsDbPFsmI2mYSFWZBtctJ726yV6MGEHCxY", "test")
+	f, err := os.Open("main.go")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	/*
+		err = b.Mkdir("/root")
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+	*/
+
+	statusCode := b.SaveFile("main file.go", f, fi.Size())
+	if statusCode != http.StatusOK {
+		fmt.Println(statusCode)
+	}
+}
